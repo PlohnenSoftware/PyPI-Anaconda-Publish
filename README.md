@@ -303,8 +303,11 @@ mode on Linux and macOS, covering the conda path, the PyPI-only path and the
 generated-project path. Get it green before moving the `v1` tag — consumers pin
 a moving major tag, so a bad push breaks every one of them at once.
 
+Releases use **major tags only** — `v1`, `v2` — with no patch tags. The tag is
+signed and moved forward for every compatible change:
+
 ```bash
-git tag -fa v1 -m "v1.2.0" && git push --force origin v1
+git tag -f -s v1 -m "v1" && git push --force origin v1
 ```
 
 A breaking input change means a new `v2`, leaving `v1` where it is.
