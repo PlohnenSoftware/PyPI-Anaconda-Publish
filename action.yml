@@ -244,23 +244,45 @@ runs:
           --output-dir .conda-build/out \
           "${channels[@]}"
 
+    # The two uploads are independent: neither can stop the other from being
+    # attempted. Each records its own outcome and the job status is decided
+    # afterwards, in "Report upload results".
+    #
+    # Everything that can fail cheaply -- tests, build, conda build -- has
+    # already run by this point, so reaching here means the artifacts are good
+    # and only the network calls remain. An anaconda.org upload is replaceable,
+    # so letting it proceed after a PyPI failure costs nothing and saves a
+    # manual re-upload.
     - name: Publish to PyPI
+      id: pypi
       if: inputs.dry_run != 'true' && inputs.publish_pypi == 'true'
       shell: bash
       working-directory: ${{ inputs.project_dir }}
       env:
         PUBLISH_URL: ${{ inputs.pypi_publish_url }}
       run: |
-        set -euo pipefail
+        # No -e: a failure here must not skip the anaconda.org upload.
+        set -uo pipefail
+
         # No token: uv detects the Actions OIDC environment and exchanges the
         # ID token for a short-lived PyPI token. Needs id-token: write on the job.
+        rc=0
         if [ -n "$PUBLISH_URL" ]; then
-          uv publish --publish-url "$PUBLISH_URL"
+          uv publish --publish-url "$PUBLISH_URL" || rc=$?
         else
-          uv publish
+          uv publish || rc=$?
+        fi
+
+        if [ "$rc" -eq 0 ]; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+        else
+          echo "outcome=failed" >> "$GITHUB_OUTPUT"
+          echo "::error::PyPI publish failed (exit $rc). The anaconda.org upload" \
+               "still runs; the job fails at the end."
         fi
 
     - name: Upload to anaconda.org
+      id: conda
       if: inputs.dry_run != 'true' && inputs.anaconda_owner != ''
       shell: bash
       working-directory: ${{ inputs.project_dir }}
@@ -269,13 +291,19 @@ runs:
         OWNER: ${{ inputs.anaconda_owner }}
         LABEL: ${{ inputs.anaconda_label }}
       run: |
-        set -euo pipefail
+        # No -e, for the same reason as above: this step reports rather than aborts.
+        set -uo pipefail
+
+        fail() {
+          echo "outcome=failed" >> "$GITHUB_OUTPUT"
+          echo "::error::$*"
+          exit 0
+        }
 
         if [ -z "$ANACONDA_API_KEY" ]; then
-          echo "::error::anaconda_api_key is empty. Create a token with write" \
-               "access at https://anaconda.org/settings/access and pass it as" \
-               "the anaconda_api_key input."
-          exit 1
+          fail "anaconda_api_key is empty. Create a token with write access at" \
+               "https://anaconda.org/settings/access and pass it as the" \
+               "anaconda_api_key input."
         fi
 
         packages=()
@@ -284,13 +312,40 @@ runs:
         done < <(find .conda-build/out -type f \( -name '*.conda' -o -name '*.tar.bz2' \) | sort)
 
         if [ ${#packages[@]} -eq 0 ]; then
-          echo "::error::no conda package was produced under .conda-build/out"
-          exit 1
+          fail "no conda package was produced under .conda-build/out"
         fi
 
         printf 'uploading to anaconda.org/%s (label %s):\n' "$OWNER" "$LABEL"
         printf '  %s\n' "${packages[@]}"
-        rattler-build upload anaconda -o "$OWNER" -c "$LABEL" "${packages[@]}"
+
+        if rattler-build upload anaconda -o "$OWNER" -c "$LABEL" "${packages[@]}"; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+        else
+          fail "anaconda.org upload failed."
+        fi
+
+    # Both uploads swallow their own failure so the other still runs, so the
+    # job status has to be decided here.
+    - name: Report upload results
+      if: inputs.dry_run != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.meta.outputs.version }}
+        PYPI: ${{ steps.pypi.outputs.outcome }}
+        CONDA: ${{ steps.conda.outputs.outcome }}
+      run: |
+        set -uo pipefail
+        printf 'PyPI:         %s\n' "${PYPI:-skipped}"
+        printf 'anaconda.org: %s\n' "${CONDA:-skipped}"
+
+        if [ "${PYPI:-}" = failed ] || [ "${CONDA:-}" = failed ]; then
+          if [ "${PYPI:-}" = success ]; then
+            echo "::error::PyPI published $VERSION but anaconda.org did not." \
+                 "Re-running this workflow will fail on PyPI as a duplicate:" \
+                 "upload the conda package by hand, or bump to the next version."
+          fi
+          exit 1
+        fi
 
     # Runs from the repository root, not project_dir, so a failure in prepare
     # cannot turn this always() step into a second, confusing error.
@@ -300,9 +355,10 @@ runs:
       env:
         VERSION: ${{ steps.meta.outputs.version }}
         DRY_RUN: ${{ inputs.dry_run }}
-        PYPI: ${{ inputs.publish_pypi }}
         OWNER: ${{ inputs.anaconda_owner }}
         PROJECT_DIR: ${{ inputs.project_dir }}
+        PYPI_OUTCOME: ${{ steps.pypi.outputs.outcome }}
+        CONDA_OUTCOME: ${{ steps.conda.outputs.outcome }}
       run: |
         set -uo pipefail
         {
@@ -310,8 +366,10 @@ runs:
           if [ "$DRY_RUN" = true ]; then
             echo "Dry run - built and checked, nothing uploaded."
           else
-            if [ "$PYPI" = true ]; then echo "- published to PyPI"; fi
-            if [ -n "$OWNER" ]; then echo "- published to anaconda.org/$OWNER"; fi
+            echo "| Target | Result |"
+            echo "|---|---|"
+            echo "| PyPI | ${PYPI_OUTCOME:-skipped} |"
+            echo "| anaconda.org/${OWNER:-—} | ${CONDA_OUTCOME:-skipped} |"
           fi
           echo
           echo '```'

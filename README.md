@@ -48,10 +48,32 @@ never downloaded.
 3. **Test** — across every Python version the project supports, in one job
 4. **Build** — wheel + sdist, then `twine check --strict`
 5. **Conda** — generate the recipe from `pyproject.toml`, build with rattler-build
-6. **Publish** — PyPI via OIDC, then anaconda.org
+6. **Publish** — PyPI via OIDC and anaconda.org, independently
 
-Every failure happens before the first upload. That matters because a PyPI
-version number is burned the moment it is uploaded and can never be reused.
+Everything that can fail cheaply happens in steps 1–5, so nothing is uploaded
+unless every artifact already exists and passes its checks. That matters because
+a PyPI version number is burned the moment it is uploaded and can never be
+reused.
+
+### The two uploads are independent
+
+Neither upload can stop the other from being attempted. Each records its own
+outcome and the job fails afterwards if either did:
+
+| PyPI | anaconda.org | Job |
+|---|---|---|
+| ✅ | ✅ | passes |
+| ❌ | ✅ | fails — but the conda package is published |
+| ✅ | ❌ | fails — re-upload the conda package by hand |
+| skipped | ✅ | passes |
+
+By the time uploads start, only network calls remain, so a failure in one says
+nothing about the other. Letting the anaconda.org upload proceed after a PyPI
+failure costs nothing — conda uploads are replaceable — and saves a manual
+re-upload.
+
+Set `publish_pypi: false` to publish to anaconda.org alone, which is useful
+before a PyPI trusted publisher exists.
 
 ### The tag does not set the version
 
