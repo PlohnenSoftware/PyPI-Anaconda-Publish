@@ -24,7 +24,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - uses: PlohnenSoftware/PyPI-Anaconda-Publish@v1
+      - uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
         with:
           test: pytest
           python_versions: auto
@@ -268,7 +268,7 @@ secret.
 ### Package with tests, PyPI + conda
 
 ```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v1
+- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
   with:
     test: pytest
     python_versions: auto
@@ -286,7 +286,7 @@ secret.
 packages, data-only distributions — behave exactly like checked-in ones.
 
 ```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v1
+- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
   with:
     prepare: uv run mytool generate-stubs
     project_dir: .build/stubs
@@ -297,7 +297,7 @@ packages, data-only distributions — behave exactly like checked-in ones.
 ### Rehearse on TestPyPI
 
 ```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v1
+- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
   with:
     pypi_publish_url: https://test.pypi.org/legacy/
 ```
