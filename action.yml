@@ -1,0 +1,313 @@
+# Keep this action name stable so Marketplace releases continue to publish
+# to https://github.com/marketplace/actions/pypi-and-anaconda-publish.
+name: 'PyPI and Anaconda Publish'
+description: 'Build a Python package once and publish it to PyPI with trusted publishing and to anaconda.org, without installing conda'
+author: 'PlohnenSoftware'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  project_dir:
+    description: 'Directory holding the pyproject.toml to build, relative to the repository root. Point this at a generated project when using prepare.'
+    required: false
+    default: "."
+  prepare:
+    description: 'Shell command run from the repository root before anything is read or built. Use it to generate the project named by project_dir.'
+    required: false
+    default: ""
+  test:
+    description: 'Command run via uv run inside project_dir. Empty skips testing. Give the bare command, for example pytest, not uv run pytest.'
+    required: false
+    default: ""
+  python_versions:
+    description: 'Space separated Python versions to run test against, or auto to use every stable interpreter allowed by requires-python. Empty runs the test command once on the default interpreter.'
+    required: false
+    default: ""
+  version_module:
+    description: 'Python file, relative to the repository root, whose __version__ must equal the project version. Empty skips the check.'
+    required: false
+    default: ""
+  tag:
+    description: 'Tag the project version must match, for example v1.2.3. Empty skips the check.'
+    required: false
+    default: ""
+  publish_pypi:
+    description: 'Publish to PyPI. Requires id-token write permission on the calling job.'
+    required: false
+    default: "true"
+  pypi_publish_url:
+    description: 'Alternative index URL, for example https://test.pypi.org/legacy/ for TestPyPI.'
+    required: false
+    default: ""
+  anaconda_owner:
+    description: 'anaconda.org user or organisation to upload to. Empty skips conda entirely, and rattler-build is then never downloaded.'
+    required: false
+    default: ""
+  anaconda_label:
+    description: 'anaconda.org label to upload under.'
+    required: false
+    default: "main"
+  anaconda_api_key:
+    description: 'anaconda.org API token. Required when anaconda_owner is set and dry_run is false.'
+    required: false
+    default: ""
+  build_number:
+    description: 'conda build number, for rebuilding an unchanged version.'
+    required: false
+    default: "0"
+  dry_run:
+    description: 'Build, test and check everything, upload nothing.'
+    required: false
+    default: "false"
+  rattler_build_version:
+    description: 'rattler-build release tag to use, or latest.'
+    required: false
+    default: "latest"
+
+outputs:
+  version:
+    description: 'The project version that was built.'
+    value: ${{ steps.meta.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    # Before reading metadata: for a generated project, this is what creates
+    # the pyproject.toml everything below depends on.
+    - name: Prepare
+      if: inputs.prepare != ''
+      shell: bash
+      run: ${{ inputs.prepare }}
+
+    - name: Read and verify project metadata
+      id: meta
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.project_dir }}
+        VERSION_MODULE: ${{ inputs.version_module }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        project="$GITHUB_ACTION_PATH/scripts/project.py"
+
+        version="$(python3 "$project" --project-dir "$PROJECT_DIR" version)"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+        args=(--project-dir "$PROJECT_DIR" verify)
+        if [ -n "$VERSION_MODULE" ]; then
+          args+=(--module "$VERSION_MODULE")
+        fi
+        if [ -n "$TAG" ]; then
+          args+=(--tag "$TAG")
+        fi
+        python3 "$project" "${args[@]}"
+
+    - name: Test
+      if: inputs.test != ''
+      shell: bash
+      working-directory: ${{ inputs.project_dir }}
+      env:
+        TEST_CMD: ${{ inputs.test }}
+        REQUESTED: ${{ inputs.python_versions }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$REQUESTED" ]; then
+          # shellcheck disable=SC2086 -- TEST_CMD is a command line by design
+          uv run $TEST_CMD
+          exit 0
+        fi
+
+        versions="$REQUESTED"
+        if [ "$REQUESTED" = auto ]; then
+          # Stable finals only: no betas, no free-threaded builds.
+          available="$(
+            NO_COLOR=1 uv python list --only-downloads \
+              | awk '{print $1}' \
+              | grep -E '^cpython-[0-9]+\.[0-9]+\.[0-9]+-' \
+              | grep -v -- '-freethreaded' \
+              | grep -vE '^cpython-[0-9]+\.[0-9]+\.[0-9]+(a|b|rc)' \
+              | sed -E 's/^cpython-([0-9]+\.[0-9]+)\..*/\1/' \
+              | sort -u -V | tr '\n' ' '
+          )"
+          versions="$(python3 "$GITHUB_ACTION_PATH/scripts/project.py" \
+            --project-dir . python-versions --available "$available")"
+          echo "requires-python resolves to: $versions"
+        fi
+
+        for version in $versions; do
+          echo "::group::test on Python $version"
+          # shellcheck disable=SC2086 -- TEST_CMD is a command line by design
+          uv run --python "$version" $TEST_CMD
+          echo "::endgroup::"
+        done
+
+    - name: Build wheel and sdist
+      shell: bash
+      working-directory: ${{ inputs.project_dir }}
+      run: |
+        set -euo pipefail
+        rm -rf dist
+        uv build
+        # uvx, not uv run: twine must not drag the project's own environment in.
+        uvx twine check --strict dist/*
+        ls -l dist
+
+    - name: Install rattler-build
+      if: inputs.anaconda_owner != ''
+      shell: bash
+      env:
+        RB_VERSION: ${{ inputs.rattler_build_version }}
+      run: |
+        set -euo pipefail
+
+        # Every target prefix-dev publishes, so the action runs on any runner.
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64)                 asset=rattler-build-x86_64-unknown-linux-musl ;;
+          Linux/aarch64 | Linux/arm64)  asset=rattler-build-aarch64-unknown-linux-musl ;;
+          Linux/ppc64le)                asset=rattler-build-powerpc64le-unknown-linux-gnu ;;
+          Darwin/x86_64)                asset=rattler-build-x86_64-apple-darwin ;;
+          Darwin/arm64)                 asset=rattler-build-aarch64-apple-darwin ;;
+          MINGW*/x86_64 | MSYS*/x86_64 | CYGWIN*/x86_64)
+                                        asset=rattler-build-x86_64-pc-windows-msvc.exe ;;
+          MINGW*/aarch64 | MSYS*/aarch64 | CYGWIN*/aarch64)
+                                        asset=rattler-build-aarch64-pc-windows-msvc.exe ;;
+          *) echo "::error::no rattler-build release for $(uname -s)/$(uname -m)"; exit 1 ;;
+        esac
+
+        if [ "$RB_VERSION" = latest ]; then
+          base="https://github.com/prefix-dev/rattler-build/releases/latest/download"
+        else
+          base="https://github.com/prefix-dev/rattler-build/releases/download/$RB_VERSION"
+        fi
+
+        mkdir -p "$RUNNER_TEMP/rattler-build-bin"
+        binary="$RUNNER_TEMP/rattler-build-bin/rattler-build"
+        curl -fsSL "$base/$asset" -o "$binary"
+        curl -fsSL "$base/$asset.sha256" -o "$RUNNER_TEMP/rattler-build.sha256"
+
+        expected="$(awk '{print $1}' "$RUNNER_TEMP/rattler-build.sha256")"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$binary" | awk '{print $1}')"
+        else
+          actual="$(shasum -a 256 "$binary" | awk '{print $1}')"
+        fi
+        if [ "$expected" != "$actual" ]; then
+          echo "::error::rattler-build checksum mismatch (expected $expected, got $actual)"
+          exit 1
+        fi
+
+        chmod +x "$binary"
+        echo "$RUNNER_TEMP/rattler-build-bin" >> "$GITHUB_PATH"
+        "$binary" --version
+
+    - name: Build conda package
+      if: inputs.anaconda_owner != ''
+      shell: bash
+      working-directory: ${{ inputs.project_dir }}
+      env:
+        BUILD_NUMBER: ${{ inputs.build_number }}
+      run: |
+        set -euo pipefail
+        recipe="$GITHUB_ACTION_PATH/scripts/conda_recipe.py"
+
+        python3 "$recipe" --project-dir . -o .conda-build/recipe \
+          --build-number "$BUILD_NUMBER"
+        echo "::group::recipe.yaml"
+        cat .conda-build/recipe/recipe.yaml
+        echo "::endgroup::"
+
+        channels=()
+        for channel in $(python3 "$recipe" --project-dir . --get build-channels); do
+          channels+=(-c "$channel")
+        done
+        if [ ${#channels[@]} -eq 0 ]; then
+          channels=(-c conda-forge)
+        fi
+
+        rm -rf .conda-build/out
+        rattler-build build \
+          --recipe .conda-build/recipe/recipe.yaml \
+          --output-dir .conda-build/out \
+          "${channels[@]}"
+
+    - name: Publish to PyPI
+      if: inputs.dry_run != 'true' && inputs.publish_pypi == 'true'
+      shell: bash
+      working-directory: ${{ inputs.project_dir }}
+      env:
+        PUBLISH_URL: ${{ inputs.pypi_publish_url }}
+      run: |
+        set -euo pipefail
+        # No token: uv detects the Actions OIDC environment and exchanges the
+        # ID token for a short-lived PyPI token. Needs id-token: write on the job.
+        if [ -n "$PUBLISH_URL" ]; then
+          uv publish --publish-url "$PUBLISH_URL"
+        else
+          uv publish
+        fi
+
+    - name: Upload to anaconda.org
+      if: inputs.dry_run != 'true' && inputs.anaconda_owner != ''
+      shell: bash
+      working-directory: ${{ inputs.project_dir }}
+      env:
+        ANACONDA_API_KEY: ${{ inputs.anaconda_api_key }}
+        OWNER: ${{ inputs.anaconda_owner }}
+        LABEL: ${{ inputs.anaconda_label }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$ANACONDA_API_KEY" ]; then
+          echo "::error::anaconda_api_key is empty. Create a token with write" \
+               "access at https://anaconda.org/settings/access and pass it as" \
+               "the anaconda_api_key input."
+          exit 1
+        fi
+
+        packages=()
+        while IFS= read -r package; do
+          packages+=("$package")
+        done < <(find .conda-build/out -type f \( -name '*.conda' -o -name '*.tar.bz2' \) | sort)
+
+        if [ ${#packages[@]} -eq 0 ]; then
+          echo "::error::no conda package was produced under .conda-build/out"
+          exit 1
+        fi
+
+        printf 'uploading to anaconda.org/%s (label %s):\n' "$OWNER" "$LABEL"
+        printf '  %s\n' "${packages[@]}"
+        rattler-build upload anaconda -o "$OWNER" -c "$LABEL" "${packages[@]}"
+
+    # Runs from the repository root, not project_dir, so a failure in prepare
+    # cannot turn this always() step into a second, confusing error.
+    - name: Summary
+      if: always()
+      shell: bash
+      env:
+        VERSION: ${{ steps.meta.outputs.version }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        PYPI: ${{ inputs.publish_pypi }}
+        OWNER: ${{ inputs.anaconda_owner }}
+        PROJECT_DIR: ${{ inputs.project_dir }}
+      run: |
+        set -uo pipefail
+        {
+          echo "### ${VERSION:-version unknown}"
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run - built and checked, nothing uploaded."
+          else
+            if [ "$PYPI" = true ]; then echo "- published to PyPI"; fi
+            if [ -n "$OWNER" ]; then echo "- published to anaconda.org/$OWNER"; fi
+          fi
+          echo
+          echo '```'
+          ls "$PROJECT_DIR/dist" 2>/dev/null || echo "(nothing built)"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

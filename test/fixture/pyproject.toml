@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypi-anaconda-publish-fixture"
+version = "0.1.0"
+description = "Fixture package used to self-test the PyPI and Anaconda Publish action."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "PlohnenSoftware" }]
+# PyYAML is deliberate: its conda-forge name differs from its PyPI name, so it
+# exercises the name-map translation below.
+dependencies = [
+    "PyYAML>=6",
+    "packaging>=23",
+]
+
+[project.urls]
+Homepage = "https://github.com/PlohnenSoftware/PyPI-Anaconda-Publish"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.conda-recipe]
+noarch = true
+build-channels = ["conda-forge"]
+maintainers = ["PlohnenSoftware"]
+test-imports = ["fixture_pkg"]
+name-map = { PyYAML = "pyyaml" }

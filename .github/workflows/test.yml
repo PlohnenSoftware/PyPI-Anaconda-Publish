@@ -1,0 +1,105 @@
+# Self-test. Runs the action against test/fixture with dry_run: true, so it
+# exercises every step — including the real rattler-build conda build — without
+# uploading anything.
+#
+# Run this green before moving the v1 tag. Consumers are pinned to a moving
+# major tag, so a bad push breaks all of them at once.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    # PyPI + conda path, on both runner families, which is what validates the
+    # per-target rattler-build download the README promises.
+    name: Full dry run (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: publish
+        uses: ./
+        with:
+          project_dir: test/fixture
+          test: pytest
+          python_versions: auto
+          version_module: test/fixture/src/fixture_pkg/__init__.py
+          # Only decides that the conda package gets built. dry_run means the
+          # upload step never runs, so this value is never used as a channel.
+          anaconda_owner: fixture-never-uploaded
+          dry_run: true
+
+      - name: Check the version output
+        shell: bash
+        env:
+          VERSION: ${{ steps.publish.outputs.version }}
+        run: |
+          test "$VERSION" = "0.1.0" || {
+            echo "::error::expected version output 0.1.0, got '$VERSION'"
+            exit 1
+          }
+
+      - name: Check a noarch conda package was produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find test/fixture/.conda-build/out -type f -name '*.conda' | head -n1)"
+          test -n "$found" || { echo "::error::no .conda package built"; exit 1; }
+          case "$found" in
+            */noarch/*) echo "noarch package: $found" ;;
+            *) echo "::error::expected a noarch package, got $found"; exit 1 ;;
+          esac
+
+  pypi_only:
+    # No anaconda_owner: conda is skipped entirely and rattler-build must never
+    # be downloaded.
+    name: PyPI-only dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./
+        with:
+          project_dir: test/fixture
+          test: pytest
+          dry_run: true
+
+      - name: Check conda was skipped
+        shell: bash
+        run: |
+          if [ -d test/fixture/.conda-build ]; then
+            echo "::error::conda ran despite anaconda_owner being empty"
+            exit 1
+          fi
+          if command -v rattler-build >/dev/null 2>&1; then
+            echo "::error::rattler-build was installed despite conda being skipped"
+            exit 1
+          fi
+          echo "conda correctly skipped"
+
+  generated:
+    # The generated-project path: `prepare` synthesizes the project that
+    # `project_dir` points at. This is how stub-only distributions are shipped.
+    name: Generated project dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./
+        with:
+          prepare: mkdir -p .generated && cp -r test/fixture/. .generated/
+          project_dir: .generated
+          anaconda_owner: fixture-never-uploaded
+          dry_run: true
