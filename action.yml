@@ -73,10 +73,17 @@ outputs:
 runs:
   using: composite
   steps:
+    # Pinned exactly: setup-uv publishes no moving v9 tag, and v6/v7 still run
+    # on the deprecated node20 runtime.
     - name: Set up uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v9.0.0
       with:
         enable-cache: true
+        # Default glob is uv.lock / requirements*.txt only, which never matches
+        # a lockless project and silently disables the cache.
+        cache-dependency-glob: |
+          **/uv.lock
+          **/pyproject.toml
 
     # Before reading metadata: for a generated project, this is what creates
     # the pyproject.toml everything below depends on.

@@ -294,7 +294,10 @@ def build_recipe(
     license_files = []
     for pattern in project.get("license-files", []):
         for path in sorted(project_dir.glob(pattern)):
-            shutil.copy2(path, output_dir / path.name)
+            # Only vendor it beside the recipe when the sdist does not already
+            # carry it; having both makes rattler-build warn about overwriting.
+            if not (output_dir / "src" / path.name).is_file():
+                shutil.copy2(path, output_dir / path.name)
             license_files.append(path.name)
 
     license_expression = project.get("license")
