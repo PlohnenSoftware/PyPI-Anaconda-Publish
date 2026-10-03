@@ -39,23 +39,60 @@ never downloaded.
 
 ---
 
-## What it does
+## Usage
 
-1. `prepare` — optional command that generates the project, for stub-only or
-   otherwise synthesized distributions
-2. **Verify** — the project version against a tag and against a module's
-   `__version__`, before anything is built
+Every example below is **synthetic** — the package names, channel names and
+URLs are placeholders. Swap in your own.
+
+### A complete, minimal release
+
+Build and publish a pure-Python project to PyPI on every tag, no conda:
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # mints the OIDC token for PyPI
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
+        with:
+          test: pytest
+          tag: ${{ github.ref_name }}
+```
+
+That is the whole job. The version is read from `pyproject.toml`; the tag only
+triggers the run and is checked against that version before anything is built.
+
+### What the action does, in order
+
+1. **`prepare`** (optional) — generate the project, before any metadata is read
+2. **Verify** — the version against a tag and against a module's `__version__`
 3. **Test** — across every Python version the project supports, in one job
 4. **Build** — wheel + sdist, then `twine check --strict`
-5. **Conda** — generate the recipe from `pyproject.toml`, build with rattler-build
+5. **Conda** (optional) — generate the recipe from `pyproject.toml`, build with
+   rattler-build
 6. **Publish** — PyPI via OIDC and anaconda.org, independently
 
 Everything that can fail cheaply happens in steps 1–5, so nothing is uploaded
-unless every artifact already exists and passes its checks. That matters because
-a PyPI version number is burned the moment it is uploaded and can never be
-reused.
+unless every artifact already exists and passes its checks. That matters
+because a PyPI version number is burned the moment it is uploaded and can never
+be reused.
 
-### The two uploads are independent
+#### The two uploads are independent
 
 Neither upload can stop the other from being attempted. Each records its own
 outcome and the job fails afterwards if either did:
@@ -72,15 +109,238 @@ nothing about the other. Letting the anaconda.org upload proceed after a PyPI
 failure costs nothing — conda uploads are replaceable — and saves a manual
 re-upload.
 
-Set `publish_pypi: false` to publish to anaconda.org alone, which is useful
-before a PyPI trusted publisher exists.
+### Choosing what to build
 
-### The tag does not set the version
+**`project_dir`** (default `.`) — the directory holding the `pyproject.toml` to
+build, relative to the repository root. Point it at a sub-package in a monorepo.
 
-A tag only *triggers* a release; the published version comes from
-`pyproject.toml`. Tagging `v0.3.0` while the file still says `0.2.0` re-publishes
-`0.2.0`, which PyPI rejects as a duplicate — after the build, when finding out is
-no longer useful. Pass `tag:` and that becomes an immediate, legible failure.
+```yaml
+with:
+  project_dir: packages/core
+```
+
+**`prepare`** (default empty) — a shell command run from the repository root
+*before* any metadata is read. Use it to create the project that `project_dir`
+points at: stub generators, codegen, vendoring, a slimmed runtime package.
+
+```yaml
+with:
+  prepare: uv run codegen build --out .build/generated
+  project_dir: .build/generated
+```
+
+### Verifying the version before anything builds
+
+The published version always comes from `[project] version` in
+`pyproject.toml` — and it must be **static** (dynamic versions are rejected).
+Two optional checks catch mismatches *before* a build burns a version number:
+
+**`tag`** (default empty) — a tag the version must equal. A leading `v` is
+stripped, so `v1.4.0` matches version `1.4.0`.
+
+```yaml
+with:
+  tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+```
+
+Tagging `v1.4.0` while the file still says `1.3.0` re-publishes `1.3.0`, which
+PyPI rejects as a duplicate — after the build, when finding out is no longer
+useful. Passing `tag:` turns that into an immediate, legible failure.
+
+**`version_module`** (default empty) — a Python file whose `__version__` must
+equal the project version, to catch drift between the metadata and the code.
+
+```yaml
+with:
+  version_module: src/myproject/__init__.py
+```
+
+### Testing
+
+**`test`** (default empty) — the bare command run via `uv run` inside
+`project_dir`. Leave it empty to skip testing entirely. Give the command, not
+the runner: `pytest`, not `uv run pytest`.
+
+```yaml
+with:
+  test: pytest
+```
+
+**`python_versions`** (default empty) — which Python versions to run `test`
+against:
+
+| Value | Effect |
+|---|---|
+| empty | run once on the runner's default interpreter |
+| `auto` | intersect `requires-python` with the stable CPython releases uv can fetch |
+| `"3.10 3.13"` | test exactly those versions |
+
+```yaml
+with:
+  test: pytest
+  python_versions: auto
+```
+
+This runs inside **one job** — uv downloads interpreters on demand — so there is
+no build matrix, which matters because a matrix would mean a reusable workflow,
+and reusable workflows cannot use PyPI trusted publishing (see *Setup*). See
+[Python version support](#python-version-support) for the details.
+
+### Choosing what gets published
+
+The two publishers are independent; each can be turned off on its own.
+
+**`publish_pypi`** (default `true`) — upload the wheel and sdist to PyPI via
+trusted publishing (OIDC). Set it `false` to publish to anaconda.org only —
+useful before a PyPI trusted publisher exists.
+
+```yaml
+with:
+  publish_pypi: false
+```
+
+**`pypi_publish_url`** (default empty) — an alternative index URL, for
+rehearsing on TestPyPI.
+
+```yaml
+with:
+  pypi_publish_url: https://test.pypi.org/legacy/
+```
+
+**`anaconda_owner`** (default empty) — the anaconda.org user or organisation to
+upload to. **Leaving it empty skips conda entirely**: rattler-build is never
+downloaded and no conda package is built.
+
+```yaml
+with:
+  anaconda_owner: my-channel
+```
+
+**`anaconda_label`** (default `main`) — the label to upload under, e.g. `dev`
+for a pre-release channel.
+
+```yaml
+with:
+  anaconda_label: dev
+```
+
+**`anaconda_api_key`** (default empty) — the anaconda.org token. Required
+whenever `anaconda_owner` is set and `dry_run` is false.
+
+```yaml
+with:
+  anaconda_api_key: ${{ secrets.ANACONDA_API_KEY }}
+```
+
+**`build_number`** (default `0`) — the conda build number, for republishing an
+unchanged version as a fresh build.
+
+```yaml
+with:
+  build_number: 1
+```
+
+**`dry_run`** (default `false`) — build, test and check everything, upload
+nothing. This is the cheapest way to find metadata errors before a tag exists.
+
+```yaml
+with:
+  dry_run: ${{ github.event_name == 'pull_request' }}
+```
+
+### Pinning the toolchain
+
+**`rattler_build_version`** (default `latest`) — the rattler-build release tag
+to fetch, or `latest`. Pin it for reproducibility.
+
+```yaml
+with:
+  rattler_build_version: v0.8.0
+```
+
+### Conda recipe: `[tool.conda-recipe]`
+
+Optional. This table holds only what conda needs that `pyproject.toml` cannot
+already express; everything else (name, version, dependencies, license) is read
+from `[project]`. It lives in `pyproject.toml`:
+
+```toml
+[tool.conda-recipe]
+noarch = true                      # false for compiled extensions
+build-channels = ["conda-forge"]   # where dependencies come from, not where you publish
+maintainers = ["some-handle"]
+test-imports = ["myproject"]       # imported in the conda test env, with pip check
+name-map = { PyYAML = "pyyaml" }   # PyPI name -> conda-forge name, where they differ
+requirement-overrides = {}         # escape hatch for markers/extras conda cannot express
+extra-run = []                     # conda-only runtime requirements
+```
+
+**`noarch`** (default `true`) — mark the package `noarch: python`, so a single
+build serves every platform. Set `false` for compiled extensions, and matrix the
+calling job over runners (see [Architecture support](#architecture-support)).
+
+**`build-channels`** (default `["conda-forge"]`) — where build *dependencies*
+come from, not where you publish.
+
+**`maintainers`** — recorded as `recipe-maintainers` in the generated recipe.
+
+**`test-imports`** — modules imported in the conda package's test environment,
+followed by a `pip check`.
+
+**`name-map`** — map a PyPI name to its conda-forge name where they differ.
+Either spelling works as a key.
+
+**`requirement-overrides`** — escape hatch for requirements conda cannot
+express (environment markers, extras, direct URLs). A requirement whose
+normalized name matches a key here is substituted verbatim and the rest of the
+translation is skipped.
+
+**`extra-run`** — runtime requirements to add to the conda package only.
+
+Dependency translation **fails loudly** rather than silently dropping anything.
+Environment markers, extras and direct URL requirements have no conda
+equivalent, so they raise an error naming the requirement and pointing at
+`requirement-overrides`. `~=` expands to conda's two-sided form
+(`~=1.4.5` → `>=1.4.5,<1.5.0a0`), and names are normalised per PEP 503.
+
+### Putting it together
+
+PyPI + conda, tested across every supported version, rehearsed on PRs:
+
+```yaml
+- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
+  with:
+    test: pytest
+    python_versions: auto
+    version_module: src/myproject/__init__.py
+    tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    anaconda_owner: my-channel
+    anaconda_api_key: ${{ secrets.ANACONDA_API_KEY }}
+    dry_run: ${{ github.event_name == 'pull_request' }}
+```
+
+### Input reference
+
+| Input | Default | Meaning |
+|---|---|---|
+| `project_dir` | `.` | Directory holding the pyproject.toml to build |
+| `prepare` | — | Shell command run from the repo root before anything else |
+| `test` | — | Command run via `uv run`; empty skips testing |
+| `python_versions` | — | Versions to test against, or `auto` |
+| `version_module` | — | File whose `__version__` must match the project version |
+| `tag` | — | Tag the version must match, e.g. `v1.2.3` |
+| `publish_pypi` | `true` | Publish to PyPI |
+| `pypi_publish_url` | — | Alternative index, e.g. TestPyPI |
+| `anaconda_owner` | — | anaconda.org owner; **empty skips conda entirely** |
+| `anaconda_label` | `main` | anaconda.org label |
+| `anaconda_api_key` | — | anaconda.org token |
+| `build_number` | `0` | conda build number |
+| `dry_run` | `false` | Build and check, upload nothing |
+| `rattler_build_version` | `latest` | Pin rattler-build |
+
+| Output | Meaning |
+|---|---|
+| `version` | The project version that was built |
 
 ---
 
@@ -162,56 +422,6 @@ Empty tests once on the runner's default interpreter.
 
 ---
 
-## Inputs
-
-| Input | Default | Meaning |
-|---|---|---|
-| `project_dir` | `.` | Directory holding the pyproject.toml to build |
-| `prepare` | — | Shell command run from the repo root before anything else |
-| `test` | — | Command run via `uv run`; empty skips testing |
-| `python_versions` | — | Versions to test against, or `auto` |
-| `version_module` | — | File whose `__version__` must match the project version |
-| `tag` | — | Tag the version must match, e.g. `v1.2.3` |
-| `publish_pypi` | `true` | Publish to PyPI |
-| `pypi_publish_url` | — | Alternative index, e.g. TestPyPI |
-| `anaconda_owner` | — | anaconda.org owner; **empty skips conda entirely** |
-| `anaconda_label` | `main` | anaconda.org label |
-| `anaconda_api_key` | — | anaconda.org token |
-| `build_number` | `0` | conda build number |
-| `dry_run` | `false` | Build and check, upload nothing |
-| `rattler_build_version` | `latest` | Pin rattler-build |
-
-| Output | Meaning |
-|---|---|
-| `version` | The project version that was built |
-
----
-
-## `[tool.conda-recipe]`
-
-Optional. Only what conda needs and `pyproject.toml` cannot already express:
-
-```toml
-[tool.conda-recipe]
-noarch = true                      # false for compiled extensions
-build-channels = ["conda-forge"]   # where dependencies come from, not where you publish
-maintainers = ["your-handle"]
-test-imports = ["your_package"]    # imported in the conda test env, with pip check
-name-map = { PyYAML = "pyyaml" }   # PyPI name -> conda-forge name, where they differ
-requirement-overrides = {}         # escape hatch for markers/extras conda cannot express
-extra-run = []                     # conda-only runtime requirements
-```
-
-Dependency translation **fails loudly** rather than silently dropping anything.
-Environment markers, extras and direct URL requirements have no conda
-equivalent, so they raise an error naming the requirement and pointing at
-`requirement-overrides`.
-
-`~=` expands to conda's two-sided form (`~=1.4.5` → `>=1.4.5,<1.5.0a0`), and
-names are normalised per PEP 503.
-
----
-
 ## Setup
 
 ### 1. PyPI trusted publisher
@@ -260,53 +470,6 @@ secret.
 
 > The input is `anaconda_api_key`, not `..._token` — that is the name
 > rattler-build reads.
-
----
-
-## Examples
-
-### Package with tests, PyPI + conda
-
-```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
-  with:
-    test: pytest
-    python_versions: auto
-    version_module: src/mypkg/__init__.py
-    tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-    anaconda_owner: my-channel
-    anaconda_api_key: ${{ secrets.ANACONDA_API_KEY }}
-    dry_run: ${{ github.event_name == 'pull_request' }}
-```
-
-### Generated package
-
-`prepare` runs before anything is read, so it can create the project that
-`project_dir` points at. Generated distributions — type stubs, slimmed runtime
-packages, data-only distributions — behave exactly like checked-in ones.
-
-```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
-  with:
-    prepare: uv run mytool generate-stubs
-    project_dir: .build/stubs
-    tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-    dry_run: ${{ github.event_name == 'pull_request' }}
-```
-
-### Rehearse on TestPyPI
-
-```yaml
-- uses: PlohnenSoftware/PyPI-Anaconda-Publish@v2
-  with:
-    pypi_publish_url: https://test.pypi.org/legacy/
-```
-
-### Rehearse on every pull request
-
-`dry_run: ${{ github.event_name == 'pull_request' }}` builds, tests and checks
-everything — including the conda package — and uploads nothing. It is the
-cheapest way to find metadata errors before a tag exists.
 
 ---
 
