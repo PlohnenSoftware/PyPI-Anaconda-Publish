@@ -76,7 +76,7 @@ runs:
     # Pinned exactly: setup-uv publishes no moving v9 tag, and v6/v7 still run
     # on the deprecated node20 runtime.
     - name: Set up uv
-      uses: astral-sh/setup-uv@v9.0.0
+      uses: astral-sh/setup-uv@v10.2.0
       with:
         enable-cache: true
         # Default glob is uv.lock / requirements*.txt only, which never matches
